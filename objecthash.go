@@ -2,16 +2,24 @@ package objecthash
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 var (
 	ErrNormalizingFloat       = errors.New("ErrNormalizingFloat")
 	ErrUnrecognizedObjectType = errors.New("ErrUnrecognizedObjectType")
+	ErrNotImplementedYet      = errors.New("ErrNotImplementedYet")
+)
+
+const (
+	REDACTED_PREFIX = "***REDACTED*** Hash: "
 )
 
 //import "golang.org/x/text/unicode/norm"
@@ -34,11 +42,11 @@ func (h sortableHashes) Len() int           { return len(h) }
 func (h sortableHashes) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 func (h sortableHashes) Less(i, j int) bool { return bytes.Compare(h[i], h[j]) < 0 }
 
-func hashSet(s Set) ([]byte, error) {
+func hashSet(s Set, redPref string) ([]byte, error) {
 	h := make([][]byte, len(s))
 	for n, e := range s {
 		var err error
-		if h[n], err = ObjectHash(e); err != nil {
+		if h[n], err = ObjectHashWithRedaction(e, redPref); err != nil {
 			return nil, err
 		}
 	}
@@ -54,12 +62,12 @@ func hashSet(s Set) ([]byte, error) {
 	return hash('s', b.Bytes()), nil
 }
 
-func hashList(l []interface{}) ([]byte, error) {
+func hashList(l []interface{}, redPref string) ([]byte, error) {
 	h := new(bytes.Buffer)
 	for _, o := range l {
 		var b []byte
 		var err error
-		if b, err = ObjectHash(o); err != nil {
+		if b, err = ObjectHashWithRedaction(o, redPref); err != nil {
 			return nil, err
 		}
 		h.Write(b)
@@ -84,15 +92,15 @@ func (h byKHash) Less(i, j int) bool {
 	return bytes.Compare(h[i].khash, h[j].khash) < 0
 }
 
-func hashDict(d map[string]interface{}) ([]byte, error) {
+func hashDict(d map[string]interface{}, redPref string) ([]byte, error) {
 	e := make([]hashEntry, len(d))
 	n := 0
 	for k, v := range d {
 		var err error
-		if e[n].khash, err = ObjectHash(k); err != nil {
+		if e[n].khash, err = ObjectHashWithRedaction(k, redPref); err != nil {
 			return nil, err
 		}
-		if e[n].vhash, err = ObjectHash(v); err != nil {
+		if e[n].vhash, err = ObjectHashWithRedaction(v, redPref); err != nil {
 			return nil, err
 		}
 		n++
@@ -170,13 +178,25 @@ func hashBool(b bool) ([]byte, error) {
 }
 
 func ObjectHash(o interface{}) ([]byte, error) {
+	return ObjectHashWithRedaction(o, "")
+}
+
+func ObjectHashWithStdRedaction(o interface{}) ([]byte, error) {
+	return ObjectHashWithRedaction(o, REDACTED_PREFIX)
+}
+
+func ObjectHashWithRedaction(o interface{}, redPref string) ([]byte, error) {
 	switch v := o.(type) {
 	case []interface{}:
-		return hashList(v)
+		return hashList(v, redPref)
 	case string:
-		return hashUnicode(v)
+		if (len(redPref) > 0) && strings.HasPrefix(v, redPref) {
+			return hex.DecodeString(v[len(redPref):])
+		} else {
+			return hashUnicode(v)
+		}
 	case map[string]interface{}:
-		return hashDict(v)
+		return hashDict(v, redPref)
 	case float64:
 		return hashFloat(v)
 	case nil:
@@ -184,7 +204,7 @@ func ObjectHash(o interface{}) ([]byte, error) {
 	case int:
 		return hashInt(v)
 	case Set:
-		return hashSet(v)
+		return hashSet(v, redPref)
 	case bool:
 		return hashBool(v)
 	default:
@@ -198,4 +218,214 @@ func CommonJSONHash(j []byte) ([]byte, error) {
 		return nil, err
 	}
 	return ObjectHash(f)
+}
+
+/*
+ * Redact stuff
+ */
+
+func Redactible(o interface{}) (interface{}, error) {
+	switch v := o.(type) {
+	case []interface{}:
+		return redactibleList(v)
+	case map[string]interface{}:
+		return redactibleDict(v)
+	default:
+		return o, nil
+	}
+}
+
+func nonce() (string, error) {
+	n := make([]byte, 32)
+	_, err := rand.Read(n)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(n), nil
+}
+
+func redactibleIt(p interface{}) (interface{}, error) {
+	n, err := nonce()
+	if err != nil {
+		return nil, err
+	}
+	return []interface{}{n, p}, nil
+}
+
+func redactibleList(p []interface{}) (interface{}, error) {
+	rv := make([]interface{}, len(p))
+	for i, a := range p {
+		var err error
+		rv[i], err = Redactible(a)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return rv, nil
+}
+
+func redactibleDict(p map[string]interface{}) (interface{}, error) {
+	rv := make(map[string]interface{})
+	for k, v := range p {
+		c, err := Redactible(v)
+		if err != nil {
+			return nil, err
+		}
+		rv[k], err = redactibleIt(c)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return rv, nil
+}
+
+/*
+ * Unredact stuff
+ */
+func Unredactible(o interface{}) (interface{}, error) {
+	switch v := o.(type) {
+	case []interface{}:
+		return unredactibleList(v)
+	case map[string]interface{}:
+		return unredactibleDict(v)
+	default:
+		return o, nil
+	}
+}
+
+func unredactibleIt(o interface{}) (bool, interface{}, error) {
+	switch v := o.(type) {
+	case []interface{}:
+		if len(v) != 2 {
+			return false, nil, ErrUnrecognizedObjectType
+		}
+		rv, err := Unredactible(v[1])
+		if err != nil {
+			return false, nil, err
+		}
+		return true, rv, nil
+	case string:
+		if !strings.HasPrefix(v, REDACTED_PREFIX) {
+			return false, nil, ErrUnrecognizedObjectType
+		}
+		return false, nil, nil
+	default:
+		return false, nil, ErrUnrecognizedObjectType
+	}
+}
+
+func unredactibleList(p []interface{}) (interface{}, error) {
+	rv := make([]interface{}, len(p))
+	for i, a := range p {
+		var err error
+		rv[i], err = Unredactible(a)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return rv, nil
+}
+
+func unredactibleDict(p map[string]interface{}) (interface{}, error) {
+	rv := make(map[string]interface{})
+	for k, v := range p {
+		ok, v, err := unredactibleIt(v)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			rv[k] = v
+		}
+	}
+	return rv, nil
+}
+
+type Filterer map[string]Filterer
+
+func CreateFilterer(allowed string) *Filterer {
+	m := make(Filterer)
+	for _, s := range strings.Split(allowed, ",") {
+		n := m
+		for _, j := range strings.Split(s, "/") {
+			j = strings.TrimSpace(j)
+			o, ok := n[j]
+			if !ok {
+				o = make(Filterer)
+				n[j] = o
+			}
+			n = o
+		}
+	}
+	return &m
+}
+
+func (self *Filterer) IsAllowed(path []string) bool {
+	n := self
+	for _, j := range path {
+		_, ok := (*n)["*"]
+		if ok {
+			return true
+		} else {
+			o, ok := (*n)[j]
+			if ok {
+				n = &o
+			} else {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+/* Filter a previously redacted object. */
+// Format of allowed is:  expr(,expr)*
+// Format of expr is:     ident(/ident)*
+// Format if ident is:    either * or not a comma or /
+func Filtered(o interface{}, allowed string) (interface{}, error) {
+	return filterObj(o, nil, CreateFilterer(allowed))
+}
+
+func filterObj(o interface{}, path []string, f *Filterer) (interface{}, error) {
+	switch v := o.(type) {
+	case []interface{}:
+		return filterList(v, path, f)
+	case map[string]interface{}:
+		return filterDict(v, path, f)
+	default:
+		return o, nil
+	}
+}
+
+func filterList(p []interface{}, path []string, f *Filterer) (interface{}, error) {
+	rv := make([]interface{}, len(p))
+	for i, a := range p {
+		var err error
+		rv[i], err = filterObj(a, path, f)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return rv, nil
+}
+
+func filterDict(p map[string]interface{}, path []string, f *Filterer) (interface{}, error) {
+	rv := make(map[string]interface{})
+	for k, v := range p {
+		newPath := append(path, k)
+		if f.IsAllowed(newPath) {
+			var err error
+			v, err = filterObj(v, newPath, f)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			h, err := ObjectHash(v)
+			if err != nil {
+				return nil, err
+			}
+			v = REDACTED_PREFIX + hex.EncodeToString(h)
+		}
+		rv[k] = v
+	}
+	return rv, nil
 }
